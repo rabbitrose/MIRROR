@@ -1,7 +1,7 @@
 """Amazon OOD 评测：book_review + movie_review + cd_review 测试集。
 
 模型未在 Amazon 数据上训练（域内为 LongLaMP），用于检验跨数据集泛化能力。
-复用 eval_lamp_sparse 公共设施 + eval_lamp_base 的 full context 口径，
+复用公共评测设施与 full context 口径，
 仅任务列表硬编码为 book_review / movie_review / cd_review。
 
 按 CLAUDE.md 约定：直接 `python amazonOOD.py` 运行，不接收命令行参数。
@@ -15,7 +15,7 @@ import time
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))                                         
-import eval_lamp_sparse as common
+import eval_common as common
 
                                               
 OOD_TASKS = ['book_review', 'movie_review', 'cd_review']

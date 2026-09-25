@@ -40,7 +40,7 @@ from datetime import datetime
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))                       
 HUAYI_DIR = os.path.dirname(BASE_DIR)
 sys.path.insert(0, os.path.join(HUAYI_DIR, 'eval'))
-import eval_lamp_sparse as common                      
+import eval_common as common                      
 import eval_lamp_base as evalfull                       
 SUMMARY_MODEL = os.environ.get('SUMMARY_MODEL', 'Qwen3-1.7B')
 SUMMARY_TASKS = os.environ.get('SUMMARY_TASKS', 'all')

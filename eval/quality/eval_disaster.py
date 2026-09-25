@@ -31,7 +31,7 @@ import time
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))                                             
-import eval_lamp_sparse as common
+import eval_common as common
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.normpath(os.path.join(BASE_DIR, '..', 'data', 'disaster'))
@@ -360,7 +360,7 @@ def wino_split(sentence, option):
 def _shard_worker(gpu_id, shard, out_path, model_path):
     """单卡 worker：一个 vLLM 实例按 kind 分三批跑完自己那份请求。
 
-    和 eval_lamp_sparse._infer_shard 同一套思路：只让本进程看见一张卡，手写数据
+    和 公共单卡推理 worker 同一套思路：只让本进程看见一张卡，手写数据
     并行比 tensor_parallel_size=8 快得多；每个实例必须占不同的分布式端口。
     """
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)

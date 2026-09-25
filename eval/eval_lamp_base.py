@@ -10,7 +10,7 @@ import os
 import time
 from datetime import datetime
 
-import eval_lamp_sparse as common
+import eval_common as common
 
 MODEL_NAMES = ["Qwen2.5-7B-Instruct", "Qwen2.5-7B-contextSFT"]
                                                         

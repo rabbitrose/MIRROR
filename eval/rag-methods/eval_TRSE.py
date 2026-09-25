@@ -50,7 +50,7 @@ import time
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))                                             
-import eval_lamp_sparse as common
+import eval_common as common
 TRSE_H = int(os.environ.get('EVAL_TRSE_H', '5'))
 if TRSE_H <= 0:
     raise RuntimeError('EVAL_TRSE_H 必须为正整数：%s' % TRSE_H)

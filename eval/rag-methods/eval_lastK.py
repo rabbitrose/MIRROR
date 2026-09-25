@@ -40,7 +40,7 @@ import time
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))                                             
-import eval_lamp_sparse as common
+import eval_common as common
 LAST_K = int(os.environ.get('EVAL_LAST_K', '5'))
 if LAST_K <= 0:
     raise RuntimeError('EVAL_LAST_K 必须为正整数：%s' % LAST_K)
