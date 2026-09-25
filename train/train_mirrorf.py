@@ -71,7 +71,7 @@ HUAYI_DIR = os.path.dirname(BASE_DIR)
 sys.path.insert(0, os.path.join(HUAYI_DIR, 'eval'))
 sys.path.insert(0, BASE_DIR)
 import eval_lamp_base as evalfull                      
-import eval_lamp_sparse as evalbase                    
+import eval_common as evalbase                    
 import train_sft as common                             
                 
 

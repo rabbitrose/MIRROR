@@ -14,7 +14,7 @@
   * 查询用样本自己的 input（question），取 top-H，按相关度降序渲染（标准 RAG 口径）；
   * BM25 是 CPU 瓶颈，用多进程并行构造（BUILD_WORKERS）；
   * thinking 显式传 enable_thinking=False。这一点必须和 eval_lamp_base.py 对齐：
-    eval_lamp_sparse.py 因为漏传该参数，Qwen3 模板默认开思考，2026-09-17 实测 30%
+    eval_common.py 因为漏传该参数，Qwen3 模板默认开思考，2026-09-17 实测 30%
     样本输出为空、BERTScore 被压到 0.55。本文件不复现那个坑。
 
 支持的数据集（EVAL_TASKS 选择，与训练侧 TRAIN_TASKS 同一套注册表）：
@@ -38,7 +38,7 @@ import time
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))                                             
-import eval_lamp_sparse as common
+import eval_common as common
 RAG_H = int(os.environ.get('EVAL_RAG_H', '5'))
 if RAG_H <= 0:
     raise RuntimeError('EVAL_RAG_H 必须为正整数：%s' % RAG_H)
@@ -82,7 +82,7 @@ def retrieve_one(args):
     """单条样本：BM25 对 question 检索 top-H 条 profile，返回 (prefix, 纳入条数)。
 
     放在模块顶层是为了能被 multiprocessing.Pool pickle。检索失败（空 profile、
-    分词后为空导致 BM25 构造异常）时退回"取前 H 条"，与 eval_lamp_sparse 一致。
+    分词后为空导致 BM25 构造异常）时退回"取前 H 条"，与 eval_common 一致。
     """
     task, inp, profile = args
     if not profile:
@@ -121,7 +121,7 @@ def clip_content(tokenizer, prefix, question, budget):
 
 
 def render_prompt(tokenizer, content):
-    """渲染对话模板；显式传 enable_thinking，不重复 eval_lamp_sparse 漏传的坑。"""
+    """渲染对话模板；显式传 enable_thinking，不重复 eval_common 漏传的坑。"""
     messages = [{'role': 'system', 'content': common.SYSTEM_PROMPT},
                 {'role': 'user', 'content': content}]
     try:

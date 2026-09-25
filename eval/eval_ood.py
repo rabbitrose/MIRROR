@@ -20,7 +20,7 @@ os.environ.setdefault("EVAL_TASKS", "amazon")
 os.environ.setdefault("EVAL_ALGO_SUFFIX", "ood")
 os.environ.setdefault("EVAL_MODEL_NAMES", "Qwen3-1.7B")
 
-import eval_lamp_sparse as common                      
+import eval_common as common                      
 import eval_lamp_base as base                          
 
 AMAZON_TASKS = common.DATASET_GROUPS["amazon"]                                           

@@ -1,7 +1,7 @@
 """LongLaMP OOD 评测：product_review + topic_writing 测试集。
 
 模型未在这两个任务上训练（域内只有 abstract_generation），用于检验泛化能力。
-复用 eval_lamp_sparse 公共设施 + eval_lamp_base 的 full context 口径，
+复用公共评测设施与 full context 口径，
 仅任务列表硬编码为 product_review / topic_writing。
 
 按 CLAUDE.md 约定：直接 `python longlampOOD.py` 运行，不接收命令行参数。
@@ -15,7 +15,7 @@ import time
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))                                         
-import eval_lamp_sparse as common
+import eval_common as common
 
                                                                
 OOD_TASKS = ['product_review', 'topic_writing']

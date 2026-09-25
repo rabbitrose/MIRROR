@@ -27,7 +27,7 @@ from datetime import datetime
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
-import eval_lamp_sparse as common                      
+import eval_common as common                      
 
 MODELS = [n.strip() for n in os.environ.get(
     'QUALITY_MODELS',
