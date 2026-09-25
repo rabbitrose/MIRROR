@@ -23,12 +23,6 @@ Python 3.10 or 3.11 is required. Install uv, then create the locked environment:
 uv sync
 ```
 
-The project uses the Tsinghua Python package index configured in `pyproject.toml`. If the machine needs the Baidu HTTP proxy to access external services, configure it in the shell before running downloads or Git commands:
-
-```bash
-export https_proxy=http://agent.baidu.com:8891
-export http_proxy=http://agent.baidu.com:8891
-```
 
 ### 2. Prepare local directories
 
