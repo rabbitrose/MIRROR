@@ -1,4 +1,4 @@
-# MIRROR
+# MIRROR: From Imitation to Internalization in LLM Personalization
 
 Training, evaluation, and dataset preparation code for LLM personalization.
 
@@ -11,4 +11,3 @@ Training, evaluation, and dataset preparation code for LLM personalization.
 
 The MIRROR entry point is train/train_mirror.py. The MIRROR-F entry point is train/train_mirrorf.py.
 
-Model weights, checkpoints, raw datasets, generated results, logs, credentials, and third-party repositories are intentionally excluded.
