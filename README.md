@@ -8,6 +8,8 @@ Model weights, checkpoints, raw datasets, generated results, logs, credentials, 
 
 ```text
 MIRROR/
+├── ablation/
+│   └── train_mirror.py
 ├── train/
 │   ├── train_sft.py
 │   ├── train_contextsft.py
@@ -68,6 +70,13 @@ python train/train_mirror.py
 ```
 
 The public training entry points are `train_mirror.py` for MIRROR and `train_mirrorf.py` for MIRROR-F.
+
+The `ablation/` directory holds the variant used for the student/teacher thinking ablation. It exposes `OPD_STUDENT_THINKING` and `OPD_TEACHER_THINKING` so that the two roles can be switched independently:
+
+```bash
+OPD_STUDENT_THINKING=off OPD_TEACHER_THINKING=on TRAIN_TASKS=lamp \
+  python ablation/train_mirror.py
+```
 
 ## Eval
 
