@@ -28,7 +28,6 @@ MIRROR/
 │   │   ├── eval_expert.py
 │   │   └── eval_disaster.py
 │   └── OODeval/
-│       ├── longlampOOD.py
 │       └── amazonOOD.py
 ├── data/
 │   ├── download_one.py
@@ -96,7 +95,6 @@ python eval/rag-methods/eval_lastK.py
 python eval/rag-methods/eval_TRSE.py
 python eval/quality/eval_expert.py
 python eval/quality/eval_disaster.py
-python eval/OODeval/longlampOOD.py
 python eval/OODeval/amazonOOD.py
 ```
 
