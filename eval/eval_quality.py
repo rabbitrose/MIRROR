@@ -122,6 +122,31 @@ def resolve_judge_path():
     raise RuntimeError('裁判模型不存在：%s' % JUDGE_MODEL)
 
 
+def render_chat(tokenizer, messages):
+    """渲染裁判 prompt。Gemma 等模板不接受 system 角色，此时把 system 内容并入首条 user。"""
+    try:
+        return tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+    except (TypeError, ValueError):
+        pass
+    except Exception:
+        if messages and messages[0]['role'] == 'system':
+            merged = [{'role': 'user',
+                       'content': messages[0]['content'] + '\n\n' + messages[1]['content']}]
+            return render_chat(tokenizer, merged + messages[2:])
+        raise
+    try:
+        return tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True)
+    except Exception:
+        if messages and messages[0]['role'] == 'system':
+            merged = [{'role': 'user',
+                       'content': messages[0]['content'] + '\n\n' + messages[1]['content']}]
+            return tokenizer.apply_chat_template(
+                merged + messages[2:], tokenize=False, add_generation_prompt=True)
+        raise
+
+
 def build_prompt(tokenizer, task, question, candidate):
     """G-Eval 打分 prompt：给体裁说明 + 四维定义 + 评分步骤，要求四行 1-5 分。"""
     user = ('You will be given one CANDIDATE text written for a task. Your job is to rate '
@@ -145,12 +170,7 @@ def build_prompt(tokenizer, task, question, candidate):
     messages = [{'role': 'system',
                  'content': 'You are a meticulous, impartial NLG evaluation judge.'},
                 {'role': 'user', 'content': user}]
-    try:
-        return tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
-    except (TypeError, ValueError):
-        return tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True)
+    return render_chat(tokenizer, messages)
 
 
 def parse_score(text):
@@ -183,12 +203,7 @@ def build_extract_prompt(tokenizer, text):
     messages = [{'role': 'system',
                  'content': 'You extract atomic aspects from text as strict JSON.'},
                 {'role': 'user', 'content': user}]
-    try:
-        return tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
-    except (TypeError, ValueError):
-        return tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True)
+    return render_chat(tokenizer, messages)
 
 
 def parse_aspects(text):
@@ -226,12 +241,7 @@ def build_match_prompt(tokenizer, ref_aspects, cand_aspects):
     messages = [{'role': 'system',
                  'content': 'You are a meticulous aspect-alignment judge for personalized text.'},
                 {'role': 'user', 'content': user}]
-    try:
-        return tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
-    except (TypeError, ValueError):
-        return tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True)
+    return render_chat(tokenizer, messages)
 
 
 def parse_match(text):
@@ -254,6 +264,10 @@ def parse_match(text):
     overall = round((f1 * 10.0 + s) / 2.0, 3)                                    
     return {'content_recall': round(r, 3), 'content_precision': round(p, 3),
             'content_f1': round(f1, 3), 'style': round(s, 3), 'expert_overall': overall}
+
+
+# 逐样本 ExPerT 明细，由 run_expert 填充后与 G-Eval 一起落盘
+EXPERT_PER_SAMPLE = []
 
 
 def run_expert(llm, tokenizer, jobs, all_outputs, SamplingParams):
@@ -297,6 +311,9 @@ def run_expert(llm, tokenizer, jobs, all_outputs, SamplingParams):
             bad += 1; continue
         ok += 1
         agg.setdefault((j['model'], j['task']), []).append(parsed)
+        rec = {'task': j['task'], 'model': j['model'], 'sample_id': j['sid']}
+        rec.update(parsed)
+        EXPERT_PER_SAMPLE.append(rec)
     return agg, ok, bad
 
 
@@ -381,6 +398,7 @@ def main():
 
                                         
     agg = {}                                   
+    per_sample = []                              
     parsed = failed = 0
     for job, s in zip(jobs, scores):
         if s is None:
@@ -388,6 +406,10 @@ def main():
             continue
         parsed += 1
         agg.setdefault((job['model'], job['task']), []).append(s)
+        rec = {'task': job['task'], 'model': job['model'], 'sample_id': job['sid']}
+        rec.update({k: s[k] for k in DIM_KEYS})
+        rec['overall'] = s['overall']
+        per_sample.append(rec)
 
     def dim_means(rows):
         d = {k: round(sum(r[k] for r in rows) / len(rows), 3) for k in DIM_KEYS}
@@ -435,8 +457,15 @@ def main():
     path = os.path.join(common.RESULTS_DIR, stem)
     with open(path, 'w', encoding='utf-8') as fh:
         json.dump(result, fh, ensure_ascii=False, indent=2)
+    ps_path = path.replace('_sum.json', '_persample.json')
+    with open(ps_path, 'w', encoding='utf-8') as fh:
+        json.dump({'judge_model': JUDGE_MODEL, 'source_algorithm': ALGO,
+                   'geval': per_sample, 'expert': EXPERT_PER_SAMPLE},
+                  fh, ensure_ascii=False)
     print('结果已写入：%s（quality 解析 %d/%d，ExPerT 解析 %d/%d）'
           % (path, parsed, failed, expert_ok, expert_bad), flush=True)
+    print('逐样本分数：%s（G-Eval %d 条，ExPerT %d 条）'
+          % (ps_path, len(per_sample), len(EXPERT_PER_SAMPLE)), flush=True)
     for t in per_task:
         row = '  '.join('%s=%.2f' % (m, per_task[t][m]['mean_score'])
                         for m in MODELS if m in per_task[t])
@@ -460,3 +489,18 @@ def main():
 
 if __name__ == '__main__':
     main()
+    # vLLM 引擎子进程在解释器退出时偶发挂起：结果已落盘后先杀掉引擎子进程（释放显存），再直接退出
+    import sys as _s, signal as _sig, subprocess as _sp
+    _s.stdout.flush(); _s.stderr.flush()
+    def _kids(pid):
+        out = _sp.run(['pgrep', '-P', str(pid)], capture_output=True, text=True).stdout.split()
+        res = []
+        for c in out:
+            res += _kids(int(c)) + [int(c)]
+        return res
+    for _c in _kids(os.getpid()):
+        try:
+            os.kill(_c, _sig.SIGKILL)
+        except OSError:
+            pass
+    os._exit(0)

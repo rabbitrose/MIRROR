@@ -29,30 +29,31 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 HUAYI_DIR = os.path.dirname(BASE_DIR)
 sys.path.insert(0, os.path.join(HUAYI_DIR, 'eval'))
 import eval_common as evalbase
+import eval_lamp_base as evalfull
 
-                                                           
-                                                      
+# ---- 全部训练方法共用的统一超参（SFT / ContextSFT / PerCE / NextQuill / MIRROR / MIRROR-F）----
+# 各方法只在 loss 上不同；基座、数据池与顺序、步数、有效 batch、上下文额度、优化器全部取这里。
 BASE_MODEL = os.path.join(HUAYI_DIR, 'models',
-                          os.environ.get('SFT_BASE_MODEL', 'Llama-3.2-3B-Instruct'))
+                          os.environ.get('SFT_BASE_MODEL', 'Qwen3-1.7B'))
 TRAINED_DIR = os.path.join(HUAYI_DIR, 'TrainModels')
 LOG_DIR = os.path.join(HUAYI_DIR, 'logs', 'train')
 
-SAMPLES_PER_TASK = 2000                        
-MAX_SEQ_LEN = 4096                                  
-ANSWER_TOKEN_BUDGET = 512                            
+SAMPLES_PER_TASK = int(os.environ.get('TRAIN_SAMPLES_PER_TASK', '800'))
+USER_TOKEN_BUDGET = evalbase.USER_TOKEN_BUDGET     # 历史 + 问题，与评测口径一致
+MAX_SEQ_LEN = evalbase.MAX_MODEL_LEN
+ANSWER_TOKEN_BUDGET = int(os.environ.get('TRAIN_ANSWER_BUDGET', '512'))
 EPOCHS = 1
-LEARNING_RATE = 1e-4
+MAX_STEPS = int(os.environ.get('TRAIN_MAX_STEPS', '250'))
+LEARNING_RATE = float(os.environ.get('TRAIN_LR', '1e-4'))
 PER_DEVICE_BATCH = 1
-GRAD_ACCUM = 8
-                                                
+GRAD_ACCUM = int(os.environ.get('TRAIN_GRAD_ACCUM', '4'))   # 有效 batch = 4 条样本/步
+# DDP 时按卡数摊分累积步数，保持有效 batch 不变
 _DDP_WORLD = int(os.environ.get('WORLD_SIZE', '1'))
 if _DDP_WORLD > 1:
     GRAD_ACCUM = max(1, GRAD_ACCUM // _DDP_WORLD)
-SEED = 20260904
-                                                                   
-                                                     
-                                                   
-                                           
+WARMUP_RATIO = 0.05
+MAX_GRAD_NORM = 1.0
+SEED = int(os.environ.get('TRAIN_SEED', '20260904'))
 THINKING = os.environ.get('SFT_THINKING', 'off')
 if THINKING not in ('off', 'on'):
     raise RuntimeError('SFT_THINKING 只能取 off/on：%s' % THINKING)
@@ -62,6 +63,104 @@ LORA_ALPHA = 32
 LORA_DROPOUT = 0.05
 LORA_TARGETS = ['q_proj', 'k_proj', 'v_proj', 'o_proj',
                 'gate_proj', 'up_proj', 'down_proj']
+
+
+def render(tokenizer, content):
+    """渲染对话模板；不认 enable_thinking 的模板自动退回无参渲染。"""
+    messages = [{'role': 'system', 'content': evalbase.SYSTEM_PROMPT},
+                {'role': 'user', 'content': content}]
+    try:
+        return tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+            enable_thinking=(THINKING == 'on'))
+    except (TypeError, ValueError):
+        return tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True)
+
+
+def user_content(tokenizer, question):
+    """question_builder 的返回值转成最终 user 内容。
+
+    返回 (prefix, question) 二元组时，按评测同一口径截断：question 完整保留，
+    历史从尾部保留到 USER_TOKEN_BUDGET；返回字符串时原样使用。
+    """
+    if isinstance(question, tuple):
+        prefix, q = question
+        return evalfull.clip_content(tokenizer, prefix, q, USER_TOKEN_BUDGET)[0]
+    return question
+
+
+def encode_prompt_answer(tokenizer, question, answer_ids):
+    """渲染 prompt 并拼上 answer；prompt 段标签置 -100。"""
+    prompt = render(tokenizer, user_content(tokenizer, question))
+    prompt_ids = tokenizer(prompt, add_special_tokens=False)['input_ids']
+    room = MAX_SEQ_LEN - len(answer_ids)
+    if len(prompt_ids) > room:
+        prompt_ids = prompt_ids[-room:]
+    return (prompt_ids + list(answer_ids),
+            [-100] * len(prompt_ids) + list(answer_ids))
+
+
+def answer_token_ids(tokenizer, answer):
+    """gold answer 截到 ANSWER_TOKEN_BUDGET 再补 EOS。"""
+    ids = tokenizer(answer, add_special_tokens=False, truncation=True,
+                    max_length=ANSWER_TOKEN_BUDGET)['input_ids']
+    return ids + [tokenizer.eos_token_id]
+
+
+def training_arguments(output_name, **overrides):
+    """所有方法共用的 TrainingArguments；gradient checkpointing 只省显存，不改数值。"""
+    from transformers import TrainingArguments
+    kwargs = dict(
+        output_dir=os.path.join(LOG_DIR, output_name + '_checkpoints'),
+        num_train_epochs=EPOCHS,
+        max_steps=MAX_STEPS,
+        per_device_train_batch_size=PER_DEVICE_BATCH,
+        gradient_accumulation_steps=GRAD_ACCUM,
+        learning_rate=LEARNING_RATE,
+        lr_scheduler_type='cosine',
+        warmup_ratio=WARMUP_RATIO,
+        max_grad_norm=MAX_GRAD_NORM,
+        gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={'use_reentrant': False},
+        logging_steps=10,
+        save_strategy='no',
+        bf16=True,
+        report_to=[],
+        remove_unused_columns=False,
+        dataloader_num_workers=2,
+        seed=SEED,
+        data_seed=SEED,
+        ddp_find_unused_parameters=False,
+    )
+    kwargs.update(overrides)
+    return TrainingArguments(**kwargs)
+
+
+def unified_record():
+    """写进每个训练记录的统一超参，便于核对各方法确实同配置。"""
+    return {
+        'base_model': os.path.basename(BASE_MODEL),
+        'train_tasks': os.environ.get('TRAIN_TASKS', 'longlamp'),
+        'samples_per_task_pool': SAMPLES_PER_TASK,
+        'max_steps': MAX_STEPS,
+        'per_device_batch_size': PER_DEVICE_BATCH,
+        'gradient_accumulation_steps': GRAD_ACCUM,
+        'world_size': _DDP_WORLD,
+        'effective_batch_size': PER_DEVICE_BATCH * GRAD_ACCUM * _DDP_WORLD,
+        'examples_seen': MAX_STEPS * PER_DEVICE_BATCH * GRAD_ACCUM * _DDP_WORLD,
+        'learning_rate': LEARNING_RATE,
+        'lr_scheduler': 'cosine',
+        'warmup_ratio': WARMUP_RATIO,
+        'max_grad_norm': MAX_GRAD_NORM,
+        'user_token_budget': USER_TOKEN_BUDGET,
+        'max_seq_len': MAX_SEQ_LEN,
+        'answer_token_budget': ANSWER_TOKEN_BUDGET,
+        'thinking': THINKING,
+        'lora': {'r': LORA_R, 'alpha': LORA_ALPHA, 'dropout': LORA_DROPOUT,
+                 'target_modules': LORA_TARGETS},
+        'seed': SEED,
+    }
 
 
 def load_train_rows():
@@ -95,8 +194,18 @@ def load_train_rows():
 def sample_rows(task, rows, limit=SAMPLES_PER_TASK):
     """固定种子下采样，避免每次训练用到不同子集"""
     if len(rows) <= limit:
-        return rows
-    return random.Random('%s-%d' % (task, SEED)).sample(rows, limit)
+        picked = rows
+    else:
+        picked = random.Random('%s-%d' % (task, SEED)).sample(rows, limit)
+    # Reviewer 1 W2 基线：只用同一训练池里参考答案质量最高的子集（data/score_train_refs.py）
+    keep_dir = os.environ.get('TRAIN_KEEP_DIR')
+    if keep_dir:
+        import hashlib
+        keep = set(json.load(open(os.path.join(keep_dir, task + '.json')))['keep'])
+        picked = [r for r in picked if hashlib.md5(
+            (r['input'] + '\x00' + r['output']).encode('utf-8')).hexdigest() in keep]
+        print('%s: 参考答案质量过滤后保留 %d 条' % (task, len(picked)), flush=True)
+    return picked
 
 
 def build_question(task, row):
@@ -114,32 +223,10 @@ class PairDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.samples)
 
-    def _render(self, question):
-        """渲染对话模板；不认 enable_thinking 的模板自动退回无参渲染。"""
-        messages = [{'role': 'system', 'content': evalbase.SYSTEM_PROMPT},
-                    {'role': 'user', 'content': question}]
-        try:
-            return self.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True,
-                enable_thinking=(THINKING == 'on'))
-        except (TypeError, ValueError):
-            return self.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True)
-
     def __getitem__(self, i):
         question, answer = self.samples[i]
-        prompt = self._render(question)
-        prompt_ids = self.tokenizer(prompt, add_special_tokens=False)['input_ids']
-        answer_ids = self.tokenizer(
-            answer, add_special_tokens=False,
-            truncation=True, max_length=ANSWER_TOKEN_BUDGET)['input_ids']
-        answer_ids = answer_ids + [self.tokenizer.eos_token_id]
-                                           
-        room = MAX_SEQ_LEN - len(answer_ids)
-        if len(prompt_ids) > room:
-            prompt_ids = prompt_ids[-room:]
-        input_ids = prompt_ids + answer_ids
-        labels = [-100] * len(prompt_ids) + list(answer_ids)
+        input_ids, labels = encode_prompt_answer(
+            self.tokenizer, question, answer_token_ids(self.tokenizer, answer))
         return {'input_ids': input_ids, 'labels': labels}
 
 
@@ -181,7 +268,7 @@ def train_lora(suffix, method, question_builder):
     base_name = os.path.basename(BASE_MODEL)
     output_name = evalbase.with_dataset_suffix(
         base_name.replace('-Instruct', '') + suffix,
-        os.environ.get('TRAIN_TASKS'))
+        os.environ.get('TRAIN_TASKS')) + os.environ.get('TRAIN_OUTPUT_TAG', '')
     output_dir = os.path.join(TRAINED_DIR, output_name)
     os.makedirs(LOG_DIR, exist_ok=True)
     os.makedirs(TRAINED_DIR, exist_ok=True)
@@ -200,32 +287,16 @@ def train_lora(suffix, method, question_builder):
     dataset = PairDataset(tokenizer, samples)
 
     model = AutoModelForCausalLM.from_pretrained(
-        BASE_MODEL, torch_dtype=torch.bfloat16, attn_implementation='sdpa')
+        BASE_MODEL, dtype=torch.bfloat16, attn_implementation='sdpa')
     model.config.use_cache = False
     lora = LoraConfig(r=LORA_R, lora_alpha=LORA_ALPHA, lora_dropout=LORA_DROPOUT,
                       target_modules=LORA_TARGETS, bias='none',
                       task_type='CAUSAL_LM')
     model = get_peft_model(model, lora)
+    model.enable_input_require_grads()
     model.print_trainable_parameters()
 
-    args = TrainingArguments(
-        output_dir=os.path.join(LOG_DIR, output_name + '_checkpoints'),
-        num_train_epochs=EPOCHS,
-        per_device_train_batch_size=PER_DEVICE_BATCH,
-        gradient_accumulation_steps=GRAD_ACCUM,
-        learning_rate=LEARNING_RATE,
-        lr_scheduler_type='cosine',
-        warmup_ratio=0.03,
-        logging_steps=10,
-        save_strategy='no',
-        bf16=True,
-        report_to=[],
-        remove_unused_columns=False,
-        dataloader_num_workers=4,
-        seed=SEED,
-                                               
-        ddp_find_unused_parameters=False,
-    )
+    args = training_arguments(output_name)
     trainer = Trainer(model=model, args=args, train_dataset=dataset,
                       data_collator=lambda f: collate(f, tokenizer.pad_token_id))
     train_output = trainer.train()
@@ -252,19 +323,9 @@ def train_lora(suffix, method, question_builder):
         'output_model': output_name,
         'output_dir': output_dir,
         'method': method,
-        'thinking': THINKING,
-        'dataset': 'LongLaMP (user-based train)',
+        'unified': unified_record(),
         'samples_per_task': per_task,
         'total_samples': len(dataset),
-        'epochs': EPOCHS,
-        'learning_rate': LEARNING_RATE,
-        'per_device_batch_size': PER_DEVICE_BATCH,
-        'gradient_accumulation_steps': GRAD_ACCUM,
-        'max_seq_len': MAX_SEQ_LEN,
-        'answer_token_budget': ANSWER_TOKEN_BUDGET,
-        'lora': {'r': LORA_R, 'alpha': LORA_ALPHA, 'dropout': LORA_DROPOUT,
-                 'target_modules': LORA_TARGETS},
-        'seed': SEED,
         'train_metrics': train_output.metrics,
         'log_history': trainer.state.log_history,
         'train_seconds': round(train_seconds, 1),

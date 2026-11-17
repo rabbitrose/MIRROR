@@ -11,7 +11,11 @@ dependencies = [
     "pyarrow",
     "bert-score",
     "transformers>=4.56,<5",
+    "peft>=0.17,<0.19",
+    "langdetect>=1.0.9",
+    "datasets>=5.0.1",
+    "nvidia-cutlass-dsl>=4.4,<4.5",
 ]
 
 [tool.uv]
-index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+index-url = "https://mirrors.cloud.tencent.com/pypi/simple"

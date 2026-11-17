@@ -1,4 +1,5 @@
 """Shared data, inference, metric, and result utilities for MIRROR evaluation."""
+import glob
 import json
 import os
 import time
@@ -30,7 +31,9 @@ LONGLAMP_DATA_OVERRIDDEN = bool(os.environ.get('LONGLAMP_DATA_DIR'))
 AMAZON_DATA_PATH = os.path.join(BASE_DIR, 'data', 'amazon-sft')
                                                   
                                                                     
-LAMP_DATA_PATH = os.path.join(BASE_DIR, 'data', 'lamp-sft')
+# LaMP 数据根；训练用过滤集时通过 LAMP_DATA_DIR 指向 lamp-sft-filtered
+LAMP_DATA_PATH = os.environ.get(
+    'LAMP_DATA_DIR', os.path.join(BASE_DIR, 'data', 'lamp-sft'))
 
 LONGLAMP_TASKS = {
     'abstract_generation': 'abstract_generation_user',
@@ -119,7 +122,11 @@ MAX_NEW_TOKENS = int(os.environ.get('EVAL_MAX_NEW_TOKENS', '512'))
                                                       
                                                 
                                                         
-BERTSCORE_MODEL = os.environ.get('EVAL_BERTSCORE_MODEL', 'roberta-large')
+# BERTScore 默认用 models/roberta-large 本地权重（服务器不能直连 HF）；本地没有时退回 hub 名
+_LOCAL_BERTSCORE = os.path.join(MODELS_DIR, 'roberta-large')
+BERTSCORE_MODEL = os.environ.get(
+    'EVAL_BERTSCORE_MODEL',
+    _LOCAL_BERTSCORE if os.path.isdir(_LOCAL_BERTSCORE) else 'roberta-large')
 DECODE_TEMPERATURE = float(os.environ.get('EVAL_DECODE_TEMPERATURE', '0.4'))
                                                                             
                                                    
@@ -187,6 +194,59 @@ def save_evaluation_result(model_name, algorithm, method, retrieval_seconds,
 
 def _clip(text, budget=PROFILE_CHAR_BUDGET):
     return ' '.join(str(text or '').split())[:budget]
+
+
+# 历史条目的任务模板与字段，和论文附录 B（Task-specific history formatting）一致。
+# LongLaMP / LaMP 字段名沿用原始数据集，Amazon 字段名来自 data/prepare_amazon.py。
+PROFILE_TEMPLATES = {
+    'abstract_generation': ('"{title}" is a title for the abstract "{abstract}"',
+                            ('title', 'abstract')),
+    'scholarly_title': ('"{title}" is a title for the abstract "{abstract}"',
+                        ('title', 'abstract')),
+    'news_headline': ('"{title}" is a headline for the article "{text}"',
+                      ('title', 'text')),
+    'product_review': ('the review with summary "{summary}" and rating {overall} '
+                       'for the product "{description}" is "{reviewText}"',
+                       ('summary', 'overall', 'description', 'reviewText')),
+    'topic_writing': ('the reddit post with summary "{summary}" is "{content}"',
+                      ('summary', 'content')),
+}
+_AMAZON_TEMPLATE = ('the review with rating {rating} and title "{review_title}" for the '
+                    'item "{item_title}" ({item_desc}) is "{review_text}"',
+                    ('rating', 'review_title', 'item_title', 'item_desc', 'review_text'))
+PROFILE_TEMPLATES.update({t: _AMAZON_TEMPLATE for t in AMAZON_TASKS})
+PROFILE_JOINER = ', and '
+PROFILE_TAIL = '. Following the given patterns, '
+
+
+def _profile_fields(task, item):
+    """取某条历史在模板里用到的字段，逐字段压空白并按 PROFILE_CHAR_BUDGET 截断。"""
+    _, keys = PROFILE_TEMPLATES[task]
+    if item and not any(k in item for k in keys):
+        raise KeyError('%s 的历史字段与模板不符：期望 %s，实际 %s'
+                       % (task, list(keys), sorted(item)))
+    return {k: _clip(item.get(k)) for k in keys}
+
+
+def render_profile(task, item):
+    """按任务模板渲染单条历史。"""
+    template, _ = PROFILE_TEMPLATES[task]
+    return template.format(**_profile_fields(task, item))
+
+
+def render_profiles(task, items):
+    """把多条历史拼成 prompt 前缀，调用方直接在后面接 question：
+    "{例1}, and {例2}, and ... {例M}. Following the given patterns, "。
+    """
+    if not items:
+        return ''
+    return PROFILE_JOINER.join(render_profile(task, p) for p in items) + PROFILE_TAIL
+
+
+def profile_corpus(task, item):
+    """BM25 检索语料：同一条历史的输入与输出字段（如 title + abstract），不含模板措辞。"""
+    return ' '.join(v for v in _profile_fields(task, item).values() if v)
+
 
 def dataset_group(spec=None, default_group='longlamp'):
     """把任务选择字符串归一成数据集组名（longlamp / amazon / lamp / mixed）。
@@ -281,8 +341,12 @@ def compute_metrics(preds, refs, bert_scorer=None):
     bleu = sacrebleu.corpus_bleu(preds, [refs]).score
     if bert_scorer is None:
         from bert_score import BERTScorer
-        bert_scorer = BERTScorer(lang='en', model_type=BERTSCORE_MODEL, device='cuda:0',
-                                 batch_size=128, rescale_with_baseline=False)
+        from bert_score.utils import model2layers
+        # 本地路径查不到 bert_score 的默认层号，按目录名（roberta-large -> 17 层）取
+        layers = model2layers[os.path.basename(os.path.normpath(BERTSCORE_MODEL))]
+        bert_scorer = BERTScorer(lang='en', model_type=BERTSCORE_MODEL, num_layers=layers,
+                                 device='cuda:0', batch_size=128,
+                                 rescale_with_baseline=False)
     precision, recall, f1 = bert_scorer.score(preds, refs)
     return {
         'rouge-1': round(r1 / n, 4),

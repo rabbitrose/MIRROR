@@ -49,8 +49,9 @@ import train_sft as common
 FROZEN_MODEL = os.path.join(
     common.TRAINED_DIR,
     os.environ.get('NEXTQUILL_FROZEN_MODEL',
-                   os.path.basename(common.BASE_MODEL).replace('-Instruct', '')
-                   + '-contextSFT'))
+                   evalbase.with_dataset_suffix(
+                       os.path.basename(common.BASE_MODEL).replace('-Instruct', '')
+                       + '-contextSFT', os.environ.get('TRAIN_TASKS'))))
 OUTPUT_SUFFIX = os.environ.get('NEXTQUILL_OUTPUT_SUFFIX', '-NextQuill')
 
 DCE_THRESHOLD = 0.0                                       
@@ -62,18 +63,15 @@ ALIGNMENT_ALPHA = 1.0
                                                                 
                                                                    
                                          
-LEARNING_RATE = float(os.environ.get('NEXTQUILL_LR', str(common.LEARNING_RATE)))
-MAX_STEPS = int(os.environ.get('NEXTQUILL_MAX_STEPS', '0'))
+LEARNING_RATE = common.LEARNING_RATE
+MAX_STEPS = common.MAX_STEPS
 
 
 def build_context_question(task, row):
-    """与 train_contextsft.py 完全一致的带历史输入"""
-                                                     
-                       
+    """与 train_contextsft.py 完全一致的带历史输入（返回 (prefix, question)）"""
     prefix, question, _ = evalfull.full_context(
         task, row['input'], row.get('profile') or [])
-    content = prefix + question
-    return content
+    return prefix, question
 
 
 class CausalPairDataset(torch.utils.data.Dataset):
@@ -90,33 +88,13 @@ class CausalPairDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.samples)
 
-    def _encode(self, question, answer_ids):
-                                                                 
-                                                         
-        messages = [{'role': 'system', 'content': evalbase.SYSTEM_PROMPT},
-                    {'role': 'user', 'content': question}]
-        try:
-            prompt = self.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True,
-                enable_thinking=(common.THINKING == 'on'))
-        except (TypeError, ValueError):
-            prompt = self.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True)
-        prompt_ids = self.tokenizer(prompt, add_special_tokens=False)['input_ids']
-        room = common.MAX_SEQ_LEN - len(answer_ids)
-        if len(prompt_ids) > room:
-            prompt_ids = prompt_ids[-room:]
-        return (prompt_ids + answer_ids,
-                [-100] * len(prompt_ids) + list(answer_ids))
-
     def __getitem__(self, i):
         question_with_history, question_only, answer = self.samples[i]
-        answer_ids = self.tokenizer(
-            answer, add_special_tokens=False, truncation=True,
-            max_length=common.ANSWER_TOKEN_BUDGET)['input_ids']
-        answer_ids = answer_ids + [self.tokenizer.eos_token_id]
-        ids_h, labels_h = self._encode(question_with_history, answer_ids)
-        ids_x, labels_x = self._encode(question_only, answer_ids)
+        answer_ids = common.answer_token_ids(self.tokenizer, answer)
+        ids_h, labels_h = common.encode_prompt_answer(
+            self.tokenizer, question_with_history, answer_ids)
+        ids_x, labels_x = common.encode_prompt_answer(
+            self.tokenizer, question_only, answer_ids)
         return {'input_ids': ids_h, 'labels': labels_h,
                 'input_ids_no_history': ids_x, 'labels_no_history': labels_x}
 
@@ -203,6 +181,12 @@ def build_trainer_class(helper):
     from transformers import Trainer
 
     class NextQuillHFTrainer(Trainer):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            # loss 是逐 microbatch 的加权均值，不按 num_items_in_batch 归一化；
+            # 关掉该标记让 Trainer 除以累积步数，梯度才是窗口内的均值。
+            self.model_accepts_loss_kwargs = False
+
         def compute_loss(self, model, inputs, return_outputs=False,
                          **kwargs):
             weights, dce = helper.preference_weights(inputs)
@@ -232,7 +216,7 @@ def main():
     base_name = os.path.basename(common.BASE_MODEL)
     output_name = evalbase.with_dataset_suffix(
         base_name.replace('-Instruct', '') + OUTPUT_SUFFIX,
-        os.environ.get('TRAIN_TASKS'))
+        os.environ.get('TRAIN_TASKS')) + os.environ.get('TRAIN_OUTPUT_TAG', '')
     output_dir = os.path.join(common.TRAINED_DIR, output_name)
     os.makedirs(common.LOG_DIR, exist_ok=True)
     os.makedirs(common.TRAINED_DIR, exist_ok=True)
@@ -282,25 +266,7 @@ def main():
     model.enable_input_require_grads()
     model.print_trainable_parameters()
 
-    args = TrainingArguments(
-        output_dir=os.path.join(common.LOG_DIR, output_name + '_checkpoints'),
-        num_train_epochs=common.EPOCHS,
-        max_steps=MAX_STEPS if MAX_STEPS > 0 else -1,
-        per_device_train_batch_size=common.PER_DEVICE_BATCH,
-        gradient_accumulation_steps=common.GRAD_ACCUM,
-        learning_rate=LEARNING_RATE,
-        lr_scheduler_type='cosine',
-        warmup_ratio=0.03,
-        gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={'use_reentrant': False},
-        logging_steps=10,
-        save_strategy='no',
-        bf16=True,
-        report_to=[],
-        remove_unused_columns=False,
-        dataloader_num_workers=4,
-        seed=common.SEED,
-    )
+    args = common.training_arguments(output_name)
     print('学习率=%.2e  max_steps=%s  任务=%s' % (
         LEARNING_RATE, MAX_STEPS if MAX_STEPS > 0 else '(按 epoch)',
         os.environ.get('TRAIN_TASKS', 'longlamp(默认)')), flush=True)
@@ -334,24 +300,13 @@ def main():
         'method': 'NextQuill: DCE-weighted next-token loss + MCE-DCE alignment',
         'paper': 'arXiv:2506.02368',
         'frozen_model_for_dce': os.path.basename(FROZEN_MODEL),
-        'dataset': 'LongLaMP (user-based train)',
+        'unified': common.unified_record(),
         'samples_per_task': per_task,
         'total_samples': len(dataset),
-        'epochs': common.EPOCHS,
-        'max_steps': MAX_STEPS if MAX_STEPS > 0 else None,
-        'learning_rate': LEARNING_RATE,
-        'per_device_batch_size': common.PER_DEVICE_BATCH,
-        'gradient_accumulation_steps': common.GRAD_ACCUM,
-        'max_seq_len': common.MAX_SEQ_LEN,
-        'answer_token_budget': common.ANSWER_TOKEN_BUDGET,
         'dce_threshold': DCE_THRESHOLD,
         'preference_weight_lambda': PREFERENCE_WEIGHT,
         'other_weight_epsilon': OTHER_WEIGHT,
         'alignment_alpha': ALIGNMENT_ALPHA,
-        'lora': {'r': common.LORA_R, 'alpha': common.LORA_ALPHA,
-                 'dropout': common.LORA_DROPOUT,
-                 'target_modules': common.LORA_TARGETS},
-        'seed': common.SEED,
         'train_metrics': train_output.metrics,
         'log_history': trainer.state.log_history,
         'train_seconds': round(train_seconds, 1),

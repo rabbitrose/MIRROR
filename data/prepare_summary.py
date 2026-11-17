@@ -60,6 +60,8 @@ TASK_DESC = {
     'book_review': 'writing an Amazon book review',
     'movie_review': 'writing an Amazon movie/TV review',
     'cd_review': 'writing an Amazon music (CD/Vinyl) review',
+    'news_headline': 'writing a news headline for an article',
+    'scholarly_title': 'writing a paper title from its abstract',
 }
 
 SUMMARY_SYSTEM = (

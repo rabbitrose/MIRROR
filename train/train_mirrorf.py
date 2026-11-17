@@ -73,6 +73,7 @@ sys.path.insert(0, BASE_DIR)
 import eval_lamp_base as evalfull                      
 import eval_common as evalbase                    
 import train_sft as common                             
+from vllm_rollout import ROLLOUT_BACKEND, VllmRollout
                 
 
 def _resolve_model(name):
@@ -88,11 +89,14 @@ def _resolve_model(name):
 
 
 STUDENT_MODEL = _resolve_model(os.environ.get('OPD_STUDENT', 'Qwen3-1.7B'))
-TEACHER_MODEL = _resolve_model(os.environ.get('OPD_TEACHER', 'Qwen3-4B'))
-                                                         
-                        
+# 默认 teacher = 当前 student 自身（论文 Eq.3：p_T = sg[π_θ](·|c_T, ŷ_<t)），
+# 参数共享、随训练更新，只是条件里多了 gold 参考答案；设成模型名才退回独立冻结 teacher。
+TEACHER_SPEC = os.environ.get('OPD_TEACHER', 'self')
+SELF_TEACHER = TEACHER_SPEC == 'self'
+TEACHER_MODEL = STUDENT_MODEL if SELF_TEACHER else _resolve_model(TEACHER_SPEC)
 OUTPUT_NAME = evalbase.with_dataset_suffix(
-    os.environ.get('OPD_OUTPUT', 'Qwen3-1.7B-opdsftsel'), os.environ.get('TRAIN_TASKS'))
+    os.environ.get('OPD_OUTPUT', 'Qwen3-1.7B-MIRROR-F'),
+    os.environ.get('TRAIN_TASKS')) + os.environ.get('TRAIN_OUTPUT_TAG', '')
 TRAINED_DIR = common.TRAINED_DIR
 LOG_DIR = common.LOG_DIR
 FIG_DIR = os.environ.get(
@@ -106,7 +110,7 @@ THINKING = 'off'
                                           
 USER_TOKEN_BUDGET = evalbase.USER_TOKEN_BUDGET             
 MAX_SEQ_LEN = evalbase.MAX_MODEL_LEN                       
-GOLD_TOKEN_BUDGET = int(os.environ.get('OPD_GOLD_BUDGET', '2048'))
+GOLD_TOKEN_BUDGET = common.ANSWER_TOKEN_BUDGET
 REFERENCE_HEAD = os.environ.get('OPD_REF_HEAD', 'Here is a reference solution:\n')
                                                            
                                                                  
@@ -134,7 +138,7 @@ ROLLOUT_TASK_CAP = {
     'topic_writing': int(os.environ.get('OPD_CAP_TOPIC', '1280')),
 }
                                                            
-ROLLOUT_HARD_CAP = int(os.environ.get('OPD_LEN_HARD_CAP', '1280'))
+ROLLOUT_HARD_CAP = int(os.environ.get('OPD_LEN_HARD_CAP', str(common.ANSWER_TOKEN_BUDGET)))
                                                  
                                        
 GEN_TEMPERATURE = float(os.environ.get('OPD_GEN_TEMP', '1.0'))
@@ -156,15 +160,13 @@ JSD_BETA = float(os.environ.get('OPD_JSD_BETA', '0.5'))
                                                       
                                                 
                                           
-SAMPLES_PER_TASK = int(os.environ.get('OPD_SAMPLES_PER_TASK', '800'))
+SAMPLES_PER_TASK = common.SAMPLES_PER_TASK
 EPOCHS = 1
-                              
-MAX_STEPS = int(os.environ.get('OPD_MAX_STEPS', '150'))                       
-                                                                    
+MAX_STEPS = common.MAX_STEPS
 SAVE_STEPS = [int(x) for x in os.environ.get('OPD_SAVE_STEPS', '').replace(' ', '').split(',') if x]
-LEARNING_RATE = float(os.environ.get('OPD_LR', '1e-4'))
-PER_DEVICE_BATCH = 1
-GRAD_ACCUM = 1
+LEARNING_RATE = common.LEARNING_RATE
+PER_DEVICE_BATCH = int(os.environ.get('OPD_BATCH', '4'))
+GRAD_ACCUM = int(os.environ.get('OPD_GRAD_ACCUM', '1'))
                                                               
                                           
                                                      
@@ -180,9 +182,9 @@ SFT_SELECTIVE = os.environ.get('OPD_SFT_SELECTIVE', '1') != '0'
                                                     
                                                   
 SFT_REQUIRE_GROUNDED = os.environ.get('OPD_SFT_GROUNDED', '1') != '0'
-MAX_GRAD_NORM = 1.0
-WARMUP_RATIO = 0.05
-SEED = 20260910
+MAX_GRAD_NORM = common.MAX_GRAD_NORM
+WARMUP_RATIO = common.WARMUP_RATIO
+SEED = common.SEED
 
 LORA_R = 16
 LORA_ALPHA = 32
@@ -397,42 +399,76 @@ class OPDTrainer(__import__('transformers').Trainer):
         self.curve = []
         self.jsd_ema = None                          
         self.nll_ema = None                   
+        # loss 已是单样本均值；让 Trainer 按累积步数求平均，而不是把窗口内的 loss 相加
+        self.model_accepts_loss_kwargs = False
 
     @torch.no_grad()
-    def rollout(self, model, prompt_ids, device, max_new):
-        """用当前 student（含 LoRA）自采样，这是 on-policy 的关键——不能用基座。
+    def teacher_logits(self, model, prompt_ids, completion, device):
+        """teacher 分布。self 模式下就是当前 student（含 LoRA）在 teacher 上下文里的
+        detached 前向，用 eval 模式关掉 LoRA dropout，对应 sg[π_θ]。"""
+        if self.teacher is not None:
+            return completion_logits(self.teacher, prompt_ids, completion, device)
+        was_training = model.training
+        model.eval()
+        try:
+            return completion_logits(model, prompt_ids, completion, device)
+        finally:
+            if was_training:
+                model.train()
 
-        max_new 由 rollout_budget 按样本 gold 长度给出，不再是全局常量。
+    def ensure_vllm(self, model):
+        """首次用到时才起 vLLM；放在 rollout 里起可以避开 Trainer 初始化阶段的显存峰值。"""
+        if getattr(self, '_vllm', None) is None:
+            self._vllm = VllmRollout(STUDENT_MODEL, self.tok, LORA_R,
+                                     GEN_TEMPERATURE, GEN_TOP_P, SEED)
+        return self._vllm
+
+    @torch.no_grad()
+    def rollout_batch(self, model, prompts, device, max_news):
+        """一批 student prompt 同时自采样。
+
+        OPD_ROLLOUT=vllm 时交给 vLLM（同采样参数，速度快数倍）；否则用 HF generate
+        左填充批量生成。两者都只负责采样，loss 仍由 HF 前向计算。
         """
+        if ROLLOUT_BACKEND == 'vllm':
+            base = self.accelerator.unwrap_model(model)
+            return self.ensure_vllm(model).generate(base, prompts, max_news)
         was_training = model.training
         model.eval()
         base = self.accelerator.unwrap_model(model)
         base.config.use_cache = True
-        ids = torch.tensor([prompt_ids], device=device)
+        width = max(len(p) for p in prompts)
+        pad = self.tok.pad_token_id
+        ids = torch.full((len(prompts), width), pad, dtype=torch.long, device=device)
+        attn = torch.zeros((len(prompts), width), dtype=torch.long, device=device)
+        for i, p in enumerate(prompts):
+            ids[i, width - len(p):] = torch.tensor(p, device=device)
+            attn[i, width - len(p):] = 1
         out = base.generate(
             input_ids=ids,
-            attention_mask=torch.ones_like(ids),
+            attention_mask=attn,
             do_sample=GEN_TEMPERATURE > 0,
             temperature=GEN_TEMPERATURE,
             top_p=GEN_TOP_P,
-            max_new_tokens=max_new,
-            pad_token_id=self.tok.pad_token_id,
+            max_new_tokens=max(max_news),
+            pad_token_id=pad,
             eos_token_id=self.tok.eos_token_id)
         base.config.use_cache = False
         if was_training:
             model.train()
-        completion = out[0, len(prompt_ids):].tolist()
-        hit_cap = len(completion) >= max_new and self.tok.eos_token_id not in completion
-                                             
-        if self.tok.eos_token_id in completion:
-            completion = completion[:completion.index(self.tok.eos_token_id) + 1]
-        return completion, hit_cap
+        results = []
+        for i in range(len(prompts)):
+            completion = out[i, width:].tolist()
+            hit_cap = (len(completion) >= max_news[i]
+                       and self.tok.eos_token_id not in completion)
+            if self.tok.eos_token_id in completion:
+                completion = completion[:completion.index(self.tok.eos_token_id) + 1]
+            results.append((completion, hit_cap))
+        return results
+
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         device = next(model.parameters()).device
-                                                                          
-                                                                      
-                                              
         if not getattr(self, '_sg_set', False):
             self._sg_set = True
             for m in (model, getattr(self, 'model_wrapped', None)):
@@ -441,76 +477,69 @@ class OPDTrainer(__import__('transformers').Trainer):
                         m._set_static_graph()
                     except Exception:
                         pass
-        s_prompt = inputs['student_ids'][0]
-        t_prompt = inputs['teacher_ids'][0]
-        max_new = inputs['max_new'][0]
-        gold_ids = inputs['gold_ids'][0]
-        sel_mask = inputs['sel_mask'][0]
-        completion, hit_cap = self.rollout(model, s_prompt, device, max_new)
-        if len(completion) < 2:
-                                                  
+        s_prompts = inputs['student_ids']
+        t_prompts = inputs['teacher_ids']
+        max_news = inputs['max_new']
+        golds = inputs['gold_ids']
+        masks = inputs['sel_mask']
+        rolled = self.rollout_batch(model, s_prompts, device, max_news)
+
+        jsds, nlls, n_sels = [], [], []
+        for i, (completion, hit_cap) in enumerate(rolled):
+            if len(completion) < 2:
+                continue
+            with torch.no_grad():
+                t_logits = self.teacher_logits(model, t_prompts[i], completion, device)
+            s_logits = completion_logits(model, s_prompts[i], completion, device)
+            jsd_i, fwd, rev = mixed_kl(s_logits, t_logits)
+            jsds.append(jsd_i)
+            if SFT_ALPHA > 0:
+                gold_ids = golds[i]
+                sel_mask = masks[i]
+                s_gold_logits = completion_logits(model, s_prompts[i], gold_ids, device)
+                gold_tgt = torch.tensor(gold_ids, device=device)
+                mask_t = torch.tensor(sel_mask, device=device, dtype=s_gold_logits.dtype)
+                per_tok_ce = F.cross_entropy(s_gold_logits.float(), gold_tgt, reduction='none')
+                denom = mask_t.sum().clamp(min=1.0)
+                nlls.append((per_tok_ce * mask_t).sum() / denom)
+                n_sels.append(int(sum(sel_mask)))
+            self.curve.append({
+                'step': self.state.global_step,
+                'jsd': float(jsd_i.detach()),
+                'forward_kl': float(fwd),
+                'reverse_kl': float(rev),
+                'gen_tokens': len(completion),
+                'max_new': int(max_news[i]),
+                'gold_tokens': int(inputs['gold_tokens'][i]),
+                'task': inputs['task'][i],
+                'hit_cap': bool(hit_cap),
+                'n_sel': n_sels[-1] if n_sels else 0,
+                'gold_len': len(golds[i]),
+            })
+        if not jsds:
             zero = sum(p.sum() for p in model.parameters() if p.requires_grad) * 0.0
             return (zero, None) if return_outputs else zero
 
-                                                              
-        with torch.no_grad():
-            t_logits = completion_logits(self.teacher, t_prompt, completion, device)
-        s_logits = completion_logits(model, s_prompt, completion, device)
-        jsd_loss, fwd, rev = mixed_kl(s_logits, t_logits)
-
-                                                                           
-                                                                    
-                                                                  
-                                                 
+        jsd_loss = sum(jsds) / len(jsds)
         jsd_val = float(jsd_loss.detach())
         self.jsd_ema = (jsd_val if self.jsd_ema is None
                         else SFT_EMA * self.jsd_ema + (1 - SFT_EMA) * jsd_val)
-        n_sel = int(sum(sel_mask))
-        if SFT_ALPHA > 0:
-            s_gold_logits = completion_logits(model, s_prompt, gold_ids, device)
-            gold_tgt = torch.tensor(gold_ids, device=device)
-            mask_t = torch.tensor(sel_mask, device=device, dtype=s_gold_logits.dtype)
-                                                                
-            per_tok_ce = F.cross_entropy(s_gold_logits.float(), gold_tgt, reduction='none')
-            denom = mask_t.sum().clamp(min=1.0)
-            nll_loss = (per_tok_ce * mask_t).sum() / denom
+        jsd_norm = jsd_loss / max(self.jsd_ema, 1e-6)
+        if SFT_ALPHA > 0 and nlls:
+            nll_loss = sum(nlls) / len(nlls)
             nll_val = float(nll_loss.detach())
-                                                           
-            if n_sel > 0:
+            if any(n > 0 for n in n_sels):
                 self.nll_ema = (nll_val if self.nll_ema is None
                                 else SFT_EMA * self.nll_ema + (1 - SFT_EMA) * nll_val)
-            jsd_norm = jsd_loss / max(self.jsd_ema, 1e-6)
             nll_norm = nll_loss / max(self.nll_ema or 1e-6, 1e-6)
-                                                    
-            eff_alpha = SFT_ALPHA if n_sel > 0 else 0.0
+            eff_alpha = SFT_ALPHA if any(n > 0 for n in n_sels) else 0.0
             loss = (1.0 - eff_alpha) * jsd_norm + eff_alpha * nll_norm
-            jsd_norm_val = float(jsd_norm.detach())
-            nll_norm_val = float(nll_norm.detach())
+            self.curve[-1]['nll'] = nll_val
+            self.curve[-1]['jsd_norm'] = float(jsd_norm.detach())
+            self.curve[-1]['nll_norm'] = float(nll_norm.detach())
         else:
             loss = jsd_loss
-            nll_val = 0.0
-            jsd_norm_val = float((jsd_loss / max(self.jsd_ema, 1e-6)).detach())
-            nll_norm_val = 0.0
-
-        self.curve.append({
-            'step': self.state.global_step,
-            'loss': float(loss.detach()),
-            'jsd': float(jsd_loss.detach()),
-            'jsd_norm': jsd_norm_val,
-            'nll': nll_val,
-            'nll_norm': nll_norm_val,
-            'n_sel': n_sel,
-            'gold_len': len(gold_ids),
-            'forward_kl': float(fwd),
-            'reverse_kl': float(rev),
-            'gen_tokens': len(completion),
-            'max_new': int(max_new),
-            'gold_tokens': int(inputs['gold_tokens'][0]),
-            'task': inputs['task'][0],
-            'hit_cap': bool(hit_cap),
-        })
         return (loss, None) if return_outputs else loss
-              
 
 
 def smooth(xs, window=15):
@@ -592,8 +621,10 @@ def main():
         if not os.path.isdir(path):
             raise RuntimeError('模型不存在：%s' % path)
     set_seed(SEED)
-    print('OPD+选择性SFT：student=%s  teacher=%s（base_gold 上下文，thinking=%s）'
-          % (os.path.basename(STUDENT_MODEL), os.path.basename(TEACHER_MODEL),
+    print('MIRROR-F（JSD + 选择性锚定 NLL）：student=%s  teacher=%s'
+          '（gold 参考答案上下文，thinking=%s）'
+          % (os.path.basename(STUDENT_MODEL),
+             'self(当前 student, detached)' if SELF_TEACHER else os.path.basename(TEACHER_MODEL),
              THINKING), flush=True)
     if SFT_ALPHA > 0:
         mode = ('选择性(专有信息%s token)' % ('且可溯源的' if SFT_REQUIRE_GROUNDED else '')
@@ -632,35 +663,22 @@ def main():
     student.enable_input_require_grads()
     student.print_trainable_parameters()
 
-    local_rank = max(0, int(os.environ.get('LOCAL_RANK', '0')))
-    teacher = AutoModelForCausalLM.from_pretrained(
-        TEACHER_MODEL, dtype=torch.bfloat16, attn_implementation='sdpa')
-    teacher.config.use_cache = False
-    teacher.eval().requires_grad_(False)
-    teacher.to('cuda:%d' % local_rank)
+    teacher = None
+    if not SELF_TEACHER:
+        local_rank = max(0, int(os.environ.get('LOCAL_RANK', '0')))
+        teacher = AutoModelForCausalLM.from_pretrained(
+            TEACHER_MODEL, dtype=torch.bfloat16, attn_implementation='sdpa')
+        teacher.config.use_cache = False
+        teacher.eval().requires_grad_(False)
+        teacher.to('cuda:%d' % local_rank)
 
-    args = TrainingArguments(
-        output_dir=os.path.join(LOG_DIR, OUTPUT_NAME + '_checkpoints'),
-        num_train_epochs=EPOCHS,
-        max_steps=MAX_STEPS if MAX_STEPS > 0 else -1,
+    args = common.training_arguments(
+        OUTPUT_NAME,
         per_device_train_batch_size=PER_DEVICE_BATCH,
         gradient_accumulation_steps=GRAD_ACCUM,
-        learning_rate=LEARNING_RATE,
-        lr_scheduler_type='cosine',
-        warmup_ratio=WARMUP_RATIO,
-        max_grad_norm=MAX_GRAD_NORM,
-        gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={'use_reentrant': False},
-        logging_steps=10,
         save_strategy=('steps' if SAVE_STEPS else 'no'),
         save_steps=(__import__('math').gcd(*SAVE_STEPS) if len(SAVE_STEPS) > 1 else (SAVE_STEPS[0] if SAVE_STEPS else 500)),
         save_total_limit=None,
-        bf16=True,
-        report_to=[],
-        remove_unused_columns=False,
-        dataloader_num_workers=2,
-        seed=SEED,
-        ddp_find_unused_parameters=False,
     )
     trainer = OPDTrainer(teacher=teacher, tokenizer=tokenizer, model=student,
                          args=args, train_dataset=dataset, data_collator=collate)
@@ -690,10 +708,12 @@ def main():
     tail = trainer.curve[-max(1, len(trainer.curve) // 10):]
     record = {
         'student_model': os.path.basename(STUDENT_MODEL),
-        'teacher_model': os.path.basename(TEACHER_MODEL),
+        'teacher_model': 'self' if SELF_TEACHER else os.path.basename(TEACHER_MODEL),
         'output_model': OUTPUT_NAME,
         'output_dir': output_dir,
-        'method': 'cross-model on-policy distillation + SELECTIVE SFT; teacher context '
+        'method': ('on-policy self-distillation (teacher = detached current student)'
+                   if SELF_TEACHER else 'cross-model on-policy distillation')
+                  + ' + SELECTIVE SFT; teacher context '
                   '= base_gold (full history + gold answer as reference + rewrite hint); '
                   'loss = (1-alpha)*JSD_norm + alpha*NLL_norm (EMA-normalized), where the '
                   'SFT/NLL term is computed ONLY on gold tokens that are (a) informative '
@@ -701,6 +721,7 @@ def main():
                   'and not a stopword) and (b) grounded (the word appears in the student '
                   'input); other gold tokens and EOS are masked out; no personalization weights',
         'thinking': {'student': THINKING, 'teacher': THINKING},
+        'unified': common.unified_record(),
         'reference_head': REFERENCE_HEAD,
         'reference_hint': REFERENCE_HINT,
         'jsd_beta': JSD_BETA,
@@ -715,21 +736,8 @@ def main():
         'rollout_cap_hit_ratio': round(
             sum(1 for c in trainer.curve if c.get('hit_cap')) / max(1, len(trainer.curve)), 4),
         'gen_temperature': GEN_TEMPERATURE,
-        'user_token_budget': USER_TOKEN_BUDGET,
-        'max_seq_len': MAX_SEQ_LEN,
-        'gold_token_budget': GOLD_TOKEN_BUDGET,
-        'dataset': 'LongLaMP (user-based train)',
         'samples_per_task': per_task,
         'total_samples': len(dataset),
-        'epochs': EPOCHS,
-        'learning_rate': LEARNING_RATE,
-        'per_device_batch_size': PER_DEVICE_BATCH,
-        'gradient_accumulation_steps': GRAD_ACCUM,
-        'max_grad_norm': MAX_GRAD_NORM,
-        'warmup_ratio': WARMUP_RATIO,
-        'lora': {'r': LORA_R, 'alpha': LORA_ALPHA, 'dropout': LORA_DROPOUT,
-                 'target_modules': LORA_TARGETS},
-        'seed': SEED,
         'train_metrics': train_output.metrics,
         'final_tail_mean': {
             'jsd': round(sum(c['jsd'] for c in tail) / len(tail), 4),

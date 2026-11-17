@@ -51,14 +51,14 @@ CLIP_MIN = 0.8
 CLIP_MAX = 5.0                                     
                                                     
                                                      
-MAX_STEPS = int(os.environ.get('PERCE_MAX_STEPS', '300'))
+MAX_STEPS = common.MAX_STEPS
 
 
 def build_context_question(task, row):
     """全量用户历史 + 问题，与 train_contextsft.py / eval_lamp_base.py 完全一致。"""
     prefix, question, _ = evalfull.full_context(
         task, row['input'], row.get('profile') or [])
-    return prefix + question
+    return prefix, question
 
 
 class ContrastPairDataset(torch.utils.data.Dataset):
@@ -75,26 +75,13 @@ class ContrastPairDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.samples)
 
-    def _encode(self, question, answer_ids):
-        prompt = self.tokenizer.apply_chat_template(
-            [{'role': 'system', 'content': evalbase.SYSTEM_PROMPT},
-             {'role': 'user', 'content': question}],
-            tokenize=False, add_generation_prompt=True)
-        prompt_ids = self.tokenizer(prompt, add_special_tokens=False)['input_ids']
-        room = common.MAX_SEQ_LEN - len(answer_ids)
-        if len(prompt_ids) > room:
-            prompt_ids = prompt_ids[-room:]
-        return (prompt_ids + answer_ids,
-                [-100] * len(prompt_ids) + list(answer_ids))
-
     def __getitem__(self, i):
         question_with_history, question_only, answer = self.samples[i]
-        answer_ids = self.tokenizer(
-            answer, add_special_tokens=False, truncation=True,
-            max_length=common.ANSWER_TOKEN_BUDGET)['input_ids']
-        answer_ids = answer_ids + [self.tokenizer.eos_token_id]
-        ids_p, labels_p = self._encode(question_with_history, answer_ids)
-        ids_x, labels_x = self._encode(question_only, answer_ids)
+        answer_ids = common.answer_token_ids(self.tokenizer, answer)
+        ids_p, labels_p = common.encode_prompt_answer(
+            self.tokenizer, question_with_history, answer_ids)
+        ids_x, labels_x = common.encode_prompt_answer(
+            self.tokenizer, question_only, answer_ids)
         return {'input_ids': ids_p, 'labels': labels_p,
                 'input_ids_no_persona': ids_x, 'labels_no_persona': labels_x}
 
@@ -187,7 +174,7 @@ def main():
     base_name = os.path.basename(common.BASE_MODEL)
     output_name = evalbase.with_dataset_suffix(
         base_name.replace('-Instruct', '') + OUTPUT_SUFFIX,
-        os.environ.get('TRAIN_TASKS'))
+        os.environ.get('TRAIN_TASKS')) + os.environ.get('TRAIN_OUTPUT_TAG', '')
     output_dir = os.path.join(common.TRAINED_DIR, output_name)
     os.makedirs(common.LOG_DIR, exist_ok=True)
     os.makedirs(common.TRAINED_DIR, exist_ok=True)
@@ -225,26 +212,9 @@ def main():
                       target_modules=common.LORA_TARGETS, bias='none',
                       task_type='CAUSAL_LM')
     model = get_peft_model(model, lora)
+    model.enable_input_require_grads()
     model.print_trainable_parameters()
-    args = TrainingArguments(
-        output_dir=os.path.join(common.LOG_DIR, output_name + '_checkpoints'),
-        num_train_epochs=common.EPOCHS,
-                                                      
-                                                                            
-        max_steps=MAX_STEPS,
-        per_device_train_batch_size=common.PER_DEVICE_BATCH,
-        gradient_accumulation_steps=common.GRAD_ACCUM,
-        learning_rate=common.LEARNING_RATE,
-        lr_scheduler_type='cosine',
-        warmup_ratio=0.04,
-        logging_steps=10,
-        save_strategy='no',
-        bf16=True,
-        report_to=[],
-        remove_unused_columns=False,
-        dataloader_num_workers=4,
-        seed=common.SEED,
-    )
+    args = common.training_arguments(output_name)
     trainer = build_trainer_class()(
         model=model, args=args, train_dataset=dataset,
         data_collator=lambda f: collate(f, tokenizer.pad_token_id))
@@ -276,21 +246,10 @@ def main():
         'history_source': 'full user history (dataset order, same as eval_lamp_base)',
         'clip_min': CLIP_MIN,
         'clip_max': CLIP_MAX,
-        'dataset': 'LongLaMP (user-based train)',
+        'unified': common.unified_record(),
         'samples_per_task': per_task,
         'total_samples': len(dataset),
-        'max_steps': MAX_STEPS,
-        'epochs': common.EPOCHS,
-        'learning_rate': common.LEARNING_RATE,
-        'per_device_batch_size': common.PER_DEVICE_BATCH,
-        'gradient_accumulation_steps': common.GRAD_ACCUM,
-        'max_seq_len': common.MAX_SEQ_LEN,
-        'answer_token_budget': common.ANSWER_TOKEN_BUDGET,
         'cuda_visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES', 'all'),
-        'lora': {'r': common.LORA_R, 'alpha': common.LORA_ALPHA,
-                 'dropout': common.LORA_DROPOUT,
-                 'target_modules': common.LORA_TARGETS},
-        'seed': common.SEED,
         'train_metrics': train_output.metrics,
         'log_history': trainer.state.log_history,
         'train_seconds': round(train_seconds, 1),

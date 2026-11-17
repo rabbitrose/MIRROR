@@ -18,18 +18,18 @@ import train_sft as common
 
 
 def build_context_question(task, row):
-    """把用户历史拼在问题前面，与 base 评测的 full user context 一致"""
-                                                     
-                       
+    """把用户历史拼在问题前面，与 base 评测的 full user context 一致。
+
+    返回 (prefix, question)，由 train_sft.user_content 按评测同一 token 额度截断。
+    """
     prefix, question, _ = evalfull.full_context(
         task, row['input'], row.get('profile') or [])
-    content = prefix + question
-    return content
+    return prefix, question
 
 
 def main():
     common.train_lora(
-        suffix='-contextSFT',
+        suffix=os.environ.get('CONTEXTSFT_SUFFIX', '-contextSFT'),
         method='LoRA ContextSFT on (history + question, answer) pairs',
         question_builder=build_context_question,
     )
