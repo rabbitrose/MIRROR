@@ -17,3 +17,11 @@ logs/
 *.pth
 *.log
 .DS_Store
+
+# plotting scripts, figure data, and drawings stay off the remote
+paper/plot/
+paper/figs/
+paper/figs_*/
+paper/绘图/
+figs/
+*.pptx

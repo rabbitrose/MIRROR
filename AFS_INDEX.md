@@ -100,29 +100,6 @@ GitHub 中的路径 `a/b/c.py` → AFS 中的文件名 `MIRROR__a__b__c.py`。
 | `paper/natbib.sty` | `MIRROR__paper__natbib.sty` | 44.1 KB |
 | `paper/reference.bib` | `MIRROR__paper__reference.bib` | 20.0 KB |
 
-### `paper/figs`
-
-| GitHub 路径 | afs_laihuayi02 文件名 | 大小 |
-| --- | --- | --- |
-| `paper/figs/1motivation.pdf` | `MIRROR__paper__figs__1motivation.pdf` | 180.0 KB |
-| `paper/figs/2methods.pdf` | `MIRROR__paper__figs__2methods.pdf` | 432.2 KB |
-| `paper/figs/3ood.pdf` | `MIRROR__paper__figs__3ood.pdf` | 35.1 KB |
-| `paper/figs/4Geval.pdf` | `MIRROR__paper__figs__4Geval.pdf` | 33.3 KB |
-| `paper/figs/5ablationLong.pdf` | `MIRROR__paper__figs__5ablationLong.pdf` | 26.0 KB |
-| `paper/figs/5ablationShort.pdf` | `MIRROR__paper__figs__5ablationShort.pdf` | 25.8 KB |
-
-### `paper/绘图`
-
-| GitHub 路径 | afs_laihuayi02 文件名 | 大小 |
-| --- | --- | --- |
-| `paper/绘图/【old】图2：MIRROR-F.pdf` | `MIRROR__paper__绘图__【old】图2：MIRROR-F.pdf` | 439.8 KB |
-| `paper/绘图/【old】图2：MIRROR-F.pptx` | `MIRROR__paper__绘图__【old】图2：MIRROR-F.pptx` | 105.3 KB |
-| `paper/绘图/【投稿】图1：方法对比.pdf` | `MIRROR__paper__绘图__【投稿】图1：方法对比.pdf` | 180.0 KB |
-| `paper/绘图/【投稿】图1：方法对比.pptx` | `MIRROR__paper__绘图__【投稿】图1：方法对比.pptx` | 123.6 KB |
-| `paper/绘图/【投稿】绘图.pptx` | `MIRROR__paper__绘图__【投稿】绘图.pptx` | 332.7 KB |
-| `paper/绘图/图2methods.pdf` | `MIRROR__paper__绘图__图2methods.pdf` | 432.2 KB |
-| `paper/绘图/图2methods.pptx` | `MIRROR__paper__绘图__图2methods.pptx` | 98.4 KB |
-
 ### `train`
 
 | GitHub 路径 | afs_laihuayi02 文件名 | 大小 |
